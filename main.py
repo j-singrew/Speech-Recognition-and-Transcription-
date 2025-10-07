@@ -1,91 +1,64 @@
 import os
-import signal
-import soundfile as sf
-from dotenv import load_dotenv
-from pvrecorder import PvRecorder
-import numpy as np
-import pyaudio
+import time
 import requests
+from dotenv import load_dotenv
 
-# Load environment variables from a .env file
+# Load environment variables from .env file
 load_dotenv()
-api_key = os.getenv('API_KEY')
 
-audio_file_path = "recorded_audio.wav"
-endpoint = "https://api.assemblyai.com/v2/upload"
+API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
+BASE_URL = "https://api.assemblyai.com/v2"
+HEADERS = {"authorization": API_KEY}
 
-# List available audio devices using pyaudio
-p = pyaudio.PyAudio()
-print("Available audio devices:")
-for index, device in enumerate(PvRecorder.get_available_devices()):  # Remove `p` from here
-    print(f"[{index}] {device}")
-p.terminate()
+file_path = "/Users/joshuasingrew/Downloads/2.mp3"
 
-# Set device index and parameters
-device_index = 0  # Change to your preferred device index
-frame_length = 512
-sample_rate = 16000  # Change this to your desired sample rate
+# 1️⃣ Upload the file
+with open(file_path, "rb") as f:
+    upload_response = requests.post(f"{BASE_URL}/upload", headers=HEADERS, data=f)
 
-# Initialize the recorder
-recorder = None
-try:
-    recorder = PvRecorder(device_index=device_index, frame_length=frame_length, sample_rate=sample_rate)
-except Exception as e:
-    print(f"Failed to initialize recorder: {e}")
-    exit(1)
+if upload_response.status_code != 200:
+    print(f"❌ Upload failed: {upload_response.status_code}, {upload_response.text}")
+    upload_response.raise_for_status()
 
-audio = []
+upload_url = upload_response.json()["upload_url"]
+print(f"✅ File uploaded successfully! URL: {upload_url}")
 
-def signal_handler(sig, frame):
-    global recorder
-    try:
-        if recorder:
-            recorder.stop()
-            # Save the recorded audio to a file
-            audio_data = np.array(audio, dtype=np.int16)
-            sf.write(audio_file_path, audio_data, sample_rate)
-            print(f"Recording stopped and saved to '{audio_file_path}'.")
-    except Exception as e:
-        print(f"Error stopping recorder in signal handler: {e}")
-    exit(0)
+# 2️⃣ Request transcription
+transcript_request = {"audio_url": upload_url}
+transcript_response = requests.post(f"{BASE_URL}/transcript", json=transcript_request, headers=HEADERS)
 
-# Register the signal handler for graceful exit
-signal.signal(signal.SIGINT, signal_handler)
+if transcript_response.status_code != 200:
+    print(f"❌ Transcription request failed: {transcript_response.status_code}, {transcript_response.text}")
+    transcript_response.raise_for_status()
 
-try:
-    recorder.start()
-    print("Recording started. Press Ctrl+C to stop.")
+transcript_id = transcript_response.json()["id"]
+polling_endpoint = f"{BASE_URL}/transcript/{transcript_id}"
 
-    while True:
-        frame = recorder.read()
-        audio.extend(frame)
+# 3️⃣ Poll for completion with timeout
+timeout_seconds = 300   # 5 minutes
+poll_interval = 3       # check every 3 seconds
+start_time = time.time()
 
-except KeyboardInterrupt:
-    signal_handler(None, None)
-except Exception as e:
-    print(f"Error during recording: {e}")
-finally:
-    if recorder:
-        try:
-            recorder.stop()
-            recorder.delete()
-        except Exception as e:
-            print(f"Error in finally block while stopping recorder: {e}")
+print("\n⏳ Polling for transcription result...\n")
 
-headers = {
-    "authorization": api_key,
-    "content-type": "audio/wav"
-}
+while True:
+    elapsed = time.time() - start_time
+    if elapsed > timeout_seconds:
+        print(f"⏰ Timeout reached after {timeout_seconds // 60} minutes.")
+        raise TimeoutError("Transcription polling timed out.")
 
-try:
-    with open(audio_file_path, "rb") as file:
-        response = requests.post(endpoint, headers=headers, files={"file": file})
-        if response.status_code == 201:
-            upload_url = response.json().get('upload_url')
-            print(f"Upload successful. File can be accessed at: {upload_url}")
-        else:
-            print(f"Failed to upload audio file. Status code: {response.status_code}")
-except IOError as e:
-    print(f"Error reading audio file: {e}")
-except requests.exceptions.RequestException as e:
-    print(f"Error uploading audio file: {e}")
+    transcript = requests.get(polling_endpoint, headers=HEADERS).json()
+    status = transcript["status"]
+
+    if status == "completed":
+        print("\n✅ Transcription completed successfully!\n")
+        print("Full Transcript:\n")
+        print(transcript["text"])
+        break
+
+    elif status == "error":
+        raise RuntimeError(f"❌ Transcription failed: {transcript['error']}")
+
+    else:
+        print(f"Status: {status} — elapsed: {int(elapsed)}s, retrying in {poll_interval}s...")
+        time.sleep(poll_interval)
